@@ -1,0 +1,560 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation example — single Lambda with minimal IAM role and example inline code.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    Description: Environment name used in resource naming
+  # Use SSM Parameter for latest region-specific Amazon Linux 2 AMI (x86_64 gp2)
+  ImageIdSSM:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: SSM parameter for a region-aware AMI id (Amazon Linux 2 x86_64 gp2)
+  OnDemandReadThreshold:
+    Type: Number
+    Default: 1000
+    Description: Threshold for consumed read capacity units on On-Demand DynamoDB table
+  OnDemandWriteThreshold:
+    Type: Number
+    Default: 1000
+    Description: Threshold for consumed write capacity units on On-Demand DynamoDB table
+
+Resources:
+  # IAM Role for Lambda
+  HelloLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # The Lambda function itself
+  HelloLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "hello-lambda-${EnvName}-${AWS::StackName}"
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt HelloLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          GREETING: "Hello from CloudFormation!"
+      Code:
+        ZipFile: |
+          import json
+          import os
+          def handler(event, context):
+              greeting = os.environ.get('GREETING', 'Hello')
+              print('Event:', json.dumps(event))
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': greeting, 'input': event})
+                  }
+
+  ############################################################
+  # S3 copy Lambda role/function (moved before bucket notifications)
+  ############################################################
+  S3CopyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3CopyPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::source-bucket-${AWS::AccountId}-${AWS::Region}-${EnvName}-${AWS::StackName}"
+                  - !Sub "arn:aws:s3:::source-bucket-${AWS::AccountId}-${AWS::Region}-${EnvName}-${AWS::StackName}/*"
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::destination-bucket-${AWS::AccountId}-${AWS::Region}-${EnvName}-${AWS::StackName}"
+                  - !Sub "arn:aws:s3:::destination-bucket-${AWS::AccountId}-${AWS::Region}-${EnvName}-${AWS::StackName}/*"
+
+  S3CopyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "s3-copy-${EnvName}-${AWS::StackName}"
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt S3CopyLambdaRole.Arn
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Sub "source-bucket-${AWS::AccountId}-${AWS::Region}-${EnvName}-${AWS::StackName}"
+          DESTINATION_BUCKET: !Sub "destination-bucket-${AWS::AccountId}-${AWS::Region}-${EnvName}-${AWS::StackName}"
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const s3 = new AWS.S3();
+          exports.handler = async (event) => {
+            console.log('S3 event:', JSON.stringify(event));
+            const record = event.Records && event.Records[0];
+            if (!record) return { status: 'no-record' };
+            const key = record.s3.object.key;
+            const src = process.env.SOURCE_BUCKET;
+            const dst = process.env.DESTINATION_BUCKET;
+            await s3.copyObject({ Bucket: dst, CopySource: `${src}/${key}`, Key: key }).promise();
+            return { status: 'copied', key };
+          };
+
+  PermissionForS3ToInvokeCopyLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3CopyFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+
+  ############################################################
+  # S3 buckets + copy Lambda (Task 5)
+  ############################################################
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "source-bucket-${AWS::AccountId}-${AWS::Region}-${EnvName}-${AWS::StackName}"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3CopyFunction.Arn
+    DependsOn: PermissionForS3ToInvokeCopyLambda
+
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "destination-bucket-${AWS::AccountId}-${AWS::Region}-${EnvName}-${AWS::StackName}"
+    DeletionPolicy: Retain
+
+  # s3-copy resources were moved earlier in the template (avoid duplicates)
+
+  ############################################################
+  # API Gateway -> HelloLambda (Task 6)
+  ############################################################
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "demo-api-${EnvName}-${AWS::StackName}"
+
+  ApiGatewayResourceHello:
+    Type: AWS::ApiGateway::Resource
+    DependsOn: ApiGatewayRestApi
+    Properties:
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: hello
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayMethodGetHello:
+    Type: AWS::ApiGateway::Method
+    DependsOn: ApiGatewayResourceHello
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayResourceHello
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HelloLambdaFunction.Arn}/invocations
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiGatewayMethodGetHello
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: prod
+
+  LambdaInvokePermissionForApiGateway:
+    Type: AWS::Lambda::Permission
+    DependsOn: ApiGatewayDeployment
+    Properties:
+      FunctionName: !Ref HelloLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      # Restrict the permission to this API's GET /hello method
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/GET/hello"
+
+      ############################################################
+      # (end S3/API additions)
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and HTTP for the demo app
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  ApplicationEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  ApplicationInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ApplicationEC2Role
+
+  ApplicationInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      # Default AMI: please pick a valid AMI in your target region
+      ImageId: !Ref ImageIdSSM
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      IamInstanceProfile: !Ref ApplicationInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub "demo-ec2-${EnvName}-${AWS::StackName}"
+
+  # Role for EC2 control lambdas (start/stop)
+  Ec2ControlLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2ControlPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeInstances
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${ApplicationInstance}"
+
+  StopEc2Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "stop-ec2-${EnvName}-${AWS::StackName}"
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt Ec2ControlLambdaRole.Arn
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref ApplicationInstance
+      Code:
+        ZipFile: |
+          import boto3, os
+          ec2 = boto3.client('ec2')
+          def handler(event, context):
+              instance_id = os.environ.get('INSTANCE_ID')
+              if not instance_id:
+                  raise Exception('INSTANCE_ID not set')
+              ec2.stop_instances(InstanceIds=[instance_id])
+              return {'status': 'stopping', 'instance': instance_id}
+
+  StartEc2Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "start-ec2-${EnvName}-${AWS::StackName}"
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt Ec2ControlLambdaRole.Arn
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref ApplicationInstance
+      Code:
+        ZipFile: |
+          import boto3, os
+          ec2 = boto3.client('ec2')
+          def handler(event, context):
+              instance_id = os.environ.get('INSTANCE_ID')
+              if not instance_id:
+                  raise Exception('INSTANCE_ID not set')
+              ec2.start_instances(InstanceIds=[instance_id])
+              return {'status': 'starting', 'instance': instance_id}
+
+  # EventBridge scheduled rules (UTC by default) — adjust if you need local time
+  StopScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "ec2-stop-schedule-${EnvName}-${AWS::StackName}"
+      ScheduleExpression: 'cron(0 21 * * ? *)' # 21:00 UTC (9pm UTC)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StopEc2Lambda.Arn
+          Id: StopLambdaTarget
+
+  StartScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "ec2-start-schedule-${EnvName}-${AWS::StackName}"
+      ScheduleExpression: 'cron(0 9 * * ? *)' # 09:00 UTC (9am UTC)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StartEc2Lambda.Arn
+          Id: StartLambdaTarget
+
+  # Permissions for EventBridge to invoke the lambdas
+  AllowEventsToInvokeStopLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StopEc2Lambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+
+  AllowEventsToInvokeStartLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartEc2Lambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+
+  # DynamoDB: On-Demand table + alarms
+  DemoOnDemandTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "demo-on-demand-${EnvName}-${AWS::StackName}"
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # CloudWatch alarm for consumed read capacity units on the on-demand table
+  DemoOnDemandHighReadAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "dynamodb-on-demand-high-read-${EnvName}-${AWS::StackName}"
+      Namespace: AWS/DynamoDB
+      MetricName: ConsumedReadCapacityUnits
+      Dimensions:
+        - Name: TableName
+          Value: !Ref DemoOnDemandTable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref OnDemandReadThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+  # CloudWatch alarm for consumed write capacity units on the on-demand table
+  DemoOnDemandHighWriteAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "dynamodb-on-demand-high-write-${EnvName}-${AWS::StackName}"
+      Namespace: AWS/DynamoDB
+      MetricName: ConsumedWriteCapacityUnits
+      Dimensions:
+        - Name: TableName
+          Value: !Ref DemoOnDemandTable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref OnDemandWriteThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+  # CloudWatch alarms for throttle events (read/write)
+  DemoOnDemandReadThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "dynamodb-on-demand-read-throttle-${EnvName}-${AWS::StackName}"
+      Namespace: AWS/DynamoDB
+      MetricName: ReadThrottleEvents
+      Dimensions:
+        - Name: TableName
+          Value: !Ref DemoOnDemandTable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+  DemoOnDemandWriteThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "dynamodb-on-demand-write-throttle-${EnvName}-${AWS::StackName}"
+      Namespace: AWS/DynamoDB
+      MetricName: WriteThrottleEvents
+      Dimensions:
+        - Name: TableName
+          Value: !Ref DemoOnDemandTable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+  ############################################################
+  # Provisioned DynamoDB table (Task 7)
+  ############################################################
+  ProvisionedDemoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "demo-provisioned-${EnvName}-${AWS::StackName}"
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+  ############################################################
+  # CloudWatch alarm for EC2 application instance down (Task 8)
+  ############################################################
+  ApplicationInstanceDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "ec2-application-down-${EnvName}-${AWS::StackName}"
+      AlarmDescription: "Alarm when EC2 instance status check fails - indicates application is down"
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ApplicationInstance
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+  ############################################################
+  # ECR repository (for container images)
+  ############################################################
+  AppEcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "demo-app-repo-${EnvName}-${AWS::StackName}"
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              { "rulePriority": 1, "description": "Expire older images", "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 50 }, "action": { "type": "expire" } }
+            ]
+          }
+
+  # IAM user restricted for Lambda, DynamoDB and API Gateway access
+  RestrictedIAMUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "lambda-dynamo-apigw-user-${EnvName}-${AWS::StackName}"
+      Policies:
+        - PolicyName: RestrictedAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunction
+                Resource:
+                  - !GetAtt HelloLambdaFunction.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !GetAtt DemoOnDemandTable.Arn
+                  - !GetAtt ProvisionedDemoTable.Arn
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                  - apigateway:POST
+                  - apigateway:PUT
+                Resource:
+                  - !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/*"
+
+Outputs:
+  HelloLambdaName:
+    Description: 'Name of the example Lambda function'
+    Value: !Ref HelloLambdaFunction
+
+  HelloLambdaArn:
+    Description: 'ARN of the example Lambda function'
+    Value: !GetAtt HelloLambdaFunction.Arn
+
+  ApplicationInstanceId:
+    Description: 'EC2 Instance ID for the demo application'
+    Value: !Ref ApplicationInstance
+  
+  SourceBucketName:
+    Description: 'Source S3 bucket name'
+    Value: !Ref SourceBucket
+
+  DestinationBucketName:
+    Description: 'Destination S3 bucket name'
+    Value: !Ref DestinationBucket
+
+  S3CopyFunctionName:
+    Description: 'Name of the S3 copy Lambda'
+    Value: !Ref S3CopyFunction
+
+  ProvisionedDemoTableName:
+    Description: 'Name of the provisioned DynamoDB table'
+    Value: !Ref ProvisionedDemoTable
+
+  ApplicationDownAlarmName:
+    Description: 'CloudWatch alarm name that triggers when application EC2 instance is down'
+    Value: !Ref ApplicationInstanceDownAlarm
+
+  ApiGatewayRestApiId:
+    Description: 'API Gateway RestApi id (for the hello endpoint)'
+    Value: !Ref ApiGatewayRestApi
+
+  ApiInvokeUrl:
+    Description: 'Invoke URL for the API (GET /hello)'
+    Value: !Sub "https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/hello"
+
+  AppEcrRepositoryName:
+    Description: 'ECR repository name for the demo app'
+    Value: !Ref AppEcrRepository
+
+  AppEcrRepositoryUri:
+    Description: 'ECR repository URI for the demo app'
+    Value: !GetAtt AppEcrRepository.RepositoryUri
+
