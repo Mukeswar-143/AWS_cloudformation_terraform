@@ -475,6 +475,64 @@ Resources:
             ]
           }
 
+  ############################################################
+  # App Runner service role (allows App Runner to access ECR + logs)
+  ############################################################
+  AppRunnerServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "apprunner-service-role-${EnvName}-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apprunner.amazonaws.com
+                - build.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: AppRunnerAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                Resource: '*'
+
+  ############################################################
+  # App Runner service (Task: containerized app)
+  # Note: CI builds & pushes images to ECR and can update this service.
+  # Keep CI as the authoritative deployer - CFN includes this resource so the service exists
+  # (CI must push an initial image tag 'latest' to avoid a missing-image create failure).
+  ############################################################
+  AppRunnerService:
+    Type: AWS::AppRunner::Service
+    DependsOn: AppEcrRepository
+    Properties:
+      ServiceName: !Sub "demo-apprunner-${EnvName}-${AWS::StackName}"
+      SourceConfiguration:
+        ImageRepository:
+          ImageIdentifier: !Sub "${AppEcrRepository.RepositoryUri}:latest"
+          ImageRepositoryType: ECR
+          ImageConfiguration:
+            Port: '8080'
+        AuthenticationConfiguration:
+          AccessRoleArn: !GetAtt AppRunnerServiceRole.Arn
+        AutoDeploymentsEnabled: true
+
   # IAM user restricted for Lambda, DynamoDB and API Gateway access
   RestrictedIAMUser:
     Type: AWS::IAM::User
@@ -557,4 +615,12 @@ Outputs:
   AppEcrRepositoryUri:
     Description: 'ECR repository URI for the demo app'
     Value: !GetAtt AppEcrRepository.RepositoryUri
+
+  AppRunnerServiceArn:
+    Description: 'ARN of the App Runner service (if created)'
+    Value: !GetAtt AppRunnerService.ServiceArn
+
+  AppRunnerServiceUrl:
+    Description: 'Public URL for the App Runner service'
+    Value: !GetAtt AppRunnerService.ServiceUrl
 

@@ -92,11 +92,10 @@ jobs:
             echo "Creating App Runner service ${APPRUNNER_SERVICE_NAME}"
             aws apprunner create-service \
               --service-name "${APPRUNNER_SERVICE_NAME}" \
-              --source-configuration "ImageRepository={ImageIdentifier='${IMAGE_URI}',ImageRepositoryType='ECR',ImageConfiguration={Port='${IMAGE_PORT}'}},AuthenticationConfiguration={ConnectionArn=''}" \
-              --auto-deployments-enabled
+              --source-configuration "ImageRepository={ImageIdentifier='${IMAGE_URI}',ImageRepositoryType='ECR',ImageConfiguration={Port='${IMAGE_PORT}'}},AuthenticationConfiguration={ConnectionArn=''},AutoDeploymentsEnabled=true"
           else
             echo "Updating App Runner service: $SERVICE_ARN"
             aws apprunner update-service \
               --service-arn "$SERVICE_ARN" \
-              --source-configuration "ImageRepository={ImageIdentifier='${IMAGE_URI}',ImageRepositoryType='ECR',ImageConfiguration={Port='${IMAGE_PORT}'}}"
+              --source-configuration "ImageRepository={ImageIdentifier='${IMAGE_URI}',ImageRepositoryType='ECR',ImageConfiguration={Port='${IMAGE_PORT}'}},AutoDeploymentsEnabled=true"
           fi

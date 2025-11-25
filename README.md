@@ -59,3 +59,12 @@ Required repository secrets for ECR/App Runner flow:
 
 Workflow file: `.github/workflows/build-and-deploy-ecr-apprunner.yml`
 
+App Runner in CloudFormation
+---------------------------
+
+This repository also includes an `AWS::AppRunner::Service` resource in `cloud_formation/template.yml`. The template creates an App Runner Service that references the ECR image URI (uses `:latest` tag). Important notes:
+
+- CI is still the authoritative deployer: the GitHub Actions workflow builds and pushes images to ECR and then updates/creates the App Runner service. If you deploy the CloudFormation stack for the first time, ensure your CI pushes an initial `latest` image before creating the stack — otherwise the App Runner service creation may fail due to missing image.
+- If you'd rather have CloudFormation fully manage the initial App Runner deployment, consider pushing a placeholder public image first or run the CFN stack after the CI build has pushed the initial image.
+
+
