@@ -9,12 +9,12 @@ jobs:
   build-and-push:
     name: Build, push and deploy
     runs-on: ubuntu-latest
-    environment: demo
+    environment: demo   # REQUIRED to load demo environment secrets
     env:
       IMAGE_PORT: 8080
-      # optional: override repository name via repository secret or env
       ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
       APPRUNNER_SERVICE_NAME: ${{ secrets.APPRUNNER_SERVICE_NAME }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}   # Make region accessible inside run scripts
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,32 +24,35 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-southeast-1
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Determine AWS Account & ECR registry
         id: aws-info
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           echo "account=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
+
           if [ -z "${ECR_REPOSITORY}" ]; then
-            # default repository name used by earlier CloudFormation
-            ECR_REPOSITORY=demo-app-repo-${{ github.ref_name || 'main' }}
+            ECR_REPOSITORY="demo-app-repo-${{ github.ref_name || 'main' }}"
             echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> $GITHUB_ENV
           fi
-          echo "registry=${ACCOUNT_ID}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
+
+          # CORRECT REGISTRY FORMAT
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "registry=${REGISTRY}" >> $GITHUB_OUTPUT
 
       - name: Login to ECR
         run: |
-          aws ecr get-login-password | docker login --username AWS --password-stdin ${{ steps.aws-info.outputs.registry }}
+          docker logout ${{ steps.aws-info.outputs.registry }} || true
+          aws ecr get-login-password | docker login --username AWS --password-stdin \
+          ${{ steps.aws-info.outputs.registry }}
 
       - name: Ensure ECR repository exists
         run: |
           REPO=${{ env.ECR_REPOSITORY }}
-          set +e
-          aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1
-          if [ $? -ne 0 ]; then
+          if ! aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1; then
             echo "Creating ECR repository: $REPO"
-            aws ecr create-repository --repository-name "$REPO" >/dev/null
+            aws ecr create-repository --repository-name "$REPO"
           else
             echo "ECR repository $REPO already exists"
           fi
@@ -59,7 +62,8 @@ jobs:
           TAG=${GITHUB_SHA::8}
           REGISTRY=${{ steps.aws-info.outputs.registry }}
           REPO=${{ env.ECR_REPOSITORY }}
-          IMAGE=${REGISTRY}/${REPO}:${TAG}
+          IMAGE="${REGISTRY}/${REPO}:${TAG}"
+
           docker build -t "${IMAGE}" -t "${REGISTRY}/${REPO}:latest" ./app
 
       - name: Push image to ECR
@@ -76,15 +80,23 @@ jobs:
           REGISTRY=${{ steps.aws-info.outputs.registry }}
           REPO=${{ env.ECR_REPOSITORY }}
           TAG=${GITHUB_SHA::8}
-          IMAGE_URI=${REGISTRY}/${REPO}:${TAG}
+          IMAGE_URI="${REGISTRY}/${REPO}:${TAG}"
 
-          # find existing service ARN (if any)
-          SERVICE_ARN=$(aws apprunner list-services --query "ServiceSummaryList[?ServiceName=='${{ env.APPRUNNER_SERVICE_NAME }}'].ServiceArn | [0]" --output text || echo '')
+          echo "Checking if App Runner service exists: $APPRUNNER_SERVICE_NAME"
+
+          SERVICE_ARN=$(aws apprunner list-services \
+            --query "ServiceSummaryList[?ServiceName=='${APPRUNNER_SERVICE_NAME}'].ServiceArn | [0]" \
+            --output text || echo "")
 
           if [ -z "$SERVICE_ARN" ] || [ "$SERVICE_ARN" = "None" ]; then
-            echo "Creating App Runner service ${APPRUNNER_SERVICE_NAME} with image ${IMAGE_URI}"
-            aws apprunner create-service --service-name "${{ env.APPRUNNER_SERVICE_NAME }}" --source-configuration "ImageRepository={ImageIdentifier='${IMAGE_URI}',ImageRepositoryType='ECR',ImageConfiguration={Port='${IMAGE_PORT}'}}" --auto-deployments-enabled
+            echo "Creating App Runner service ${APPRUNNER_SERVICE_NAME}"
+            aws apprunner create-service \
+              --service-name "${APPRUNNER_SERVICE_NAME}" \
+              --source-configuration "ImageRepository={ImageIdentifier='${IMAGE_URI}',ImageRepositoryType='ECR',ImageConfiguration={Port='${IMAGE_PORT}'}},AuthenticationConfiguration={ConnectionArn=''}" \
+              --auto-deployments-enabled
           else
-            echo "Updating App Runner service ${APPRUNNER_SERVICE_NAME} to use image ${IMAGE_URI}"
-            aws apprunner update-service --service-arn "$SERVICE_ARN" --source-configuration "ImageRepository={ImageIdentifier='${IMAGE_URI}',ImageRepositoryType='ECR',ImageConfiguration={Port='${IMAGE_PORT}'}}"
+            echo "Updating App Runner service: $SERVICE_ARN"
+            aws apprunner update-service \
+              --service-arn "$SERVICE_ARN" \
+              --source-configuration "ImageRepository={ImageIdentifier='${IMAGE_URI}',ImageRepositoryType='ECR',ImageConfiguration={Port='${IMAGE_PORT}'}}"
           fi
