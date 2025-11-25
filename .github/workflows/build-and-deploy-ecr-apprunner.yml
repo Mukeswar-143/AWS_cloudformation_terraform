@@ -9,6 +9,7 @@ jobs:
   build-and-push:
     name: Build, push and deploy
     runs-on: ubuntu-latest
+    environment: demo
     env:
       IMAGE_PORT: 8080
       # optional: override repository name via repository secret or env
